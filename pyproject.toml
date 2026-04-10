@@ -34,6 +34,9 @@ line-length = 100
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP"]
 
+[tool.ruff.lint.per-file-ignores]
+"src/pages/*.py" = ["N999"]  # Streamlit pages use numeric prefix naming
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
