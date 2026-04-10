@@ -29,6 +29,9 @@ class Settings:
         default_factory=lambda: Decimal(_env("PAPER_TRADING_BANKROLL", "1000.00"))
     )
     min_value_edge: Decimal = field(default_factory=lambda: Decimal(_env("MIN_VALUE_EDGE", "0.05")))
+    odds_scan_interval_seconds: int = field(
+        default_factory=lambda: int(_env("ODDS_SCAN_INTERVAL_SECONDS", "300"))
+    )
 
 
 settings = Settings()
