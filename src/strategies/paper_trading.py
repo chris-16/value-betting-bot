@@ -15,7 +15,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
-from src.db.models import Bet, BetOutcome, Match, MatchStatus
+from src.db.models import Bet, BetOutcome, League, Match, MatchStatus, Prediction, Team
 
 logger = logging.getLogger(__name__)
 
@@ -462,3 +462,287 @@ def get_portfolio_stats(
         avg_odds=avg_odds,
         avg_edge=avg_edge,
     )
+
+
+# ---------------------------------------------------------------------------
+# ROI breakdown analytics
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SegmentROI:
+    """ROI statistics for a single segment (league or team)."""
+
+    name: str
+    total_bets: int
+    wins: int
+    losses: int
+    total_staked: Decimal
+    total_pnl: Decimal
+    roi: Decimal  # percentage
+
+
+def get_roi_by_league(session: Session) -> list[SegmentROI]:
+    """Compute ROI broken down by league for settled bets.
+
+    Returns:
+        List of SegmentROI, one per league, sorted by ROI descending.
+    """
+    rows = (
+        session.execute(
+            select(
+                League.name.label("league_name"),
+                func.count(Bet.id).label("total_bets"),
+                func.count(case((Bet.outcome == BetOutcome.WIN, 1))).label("wins"),
+                func.count(case((Bet.outcome == BetOutcome.LOSS, 1))).label("losses"),
+                func.coalesce(func.sum(Bet.stake), Decimal("0.00")).label("total_staked"),
+                func.coalesce(func.sum(Bet.pnl), Decimal("0.00")).label("total_pnl"),
+            )
+            .join(Match, Bet.match_id == Match.id)
+            .join(League, Match.league_id == League.id)
+            .where(Bet.outcome.in_([BetOutcome.WIN, BetOutcome.LOSS, BetOutcome.VOID]))
+            .group_by(League.name)
+            .order_by(func.sum(Bet.pnl).desc())
+        )
+        .all()
+    )
+
+    result: list[SegmentROI] = []
+    for row in rows:
+        staked = Decimal(str(row.total_staked))
+        pnl = Decimal(str(row.total_pnl))
+        roi = (
+            (pnl / staked * Decimal("100")).quantize(_PCT_QUANT, ROUND_HALF_UP)
+            if staked > 0
+            else Decimal("0.00")
+        )
+        result.append(
+            SegmentROI(
+                name=row.league_name,
+                total_bets=int(row.total_bets),
+                wins=int(row.wins),
+                losses=int(row.losses),
+                total_staked=staked.quantize(_STAKE_QUANT, ROUND_HALF_UP),
+                total_pnl=pnl.quantize(_STAKE_QUANT, ROUND_HALF_UP),
+                roi=roi,
+            )
+        )
+    return result
+
+
+def get_roi_by_team(session: Session) -> list[SegmentROI]:
+    """Compute ROI broken down by team involved in bet matches.
+
+    A bet is attributed to *both* the home and away teams in the match.
+    Returns:
+        List of SegmentROI, one per team, sorted by ROI descending.
+    """
+    # Use a union approach: attribute each bet to both home and away team
+    home_q = (
+        select(
+            Team.name.label("team_name"),
+            Bet.id.label("bet_id"),
+            Bet.outcome,
+            Bet.stake,
+            Bet.pnl,
+        )
+        .join(Match, Bet.match_id == Match.id)
+        .join(Team, Match.home_team_id == Team.id)
+        .where(Bet.outcome.in_([BetOutcome.WIN, BetOutcome.LOSS, BetOutcome.VOID]))
+    )
+
+    away_team = Team.__table__.alias("away_team")
+    away_q = (
+        select(
+            away_team.c.name.label("team_name"),
+            Bet.id.label("bet_id"),
+            Bet.outcome,
+            Bet.stake,
+            Bet.pnl,
+        )
+        .join(Match, Bet.match_id == Match.id)
+        .join(away_team, Match.away_team_id == away_team.c.id)
+        .where(Bet.outcome.in_([BetOutcome.WIN, BetOutcome.LOSS, BetOutcome.VOID]))
+    )
+
+    union = home_q.union_all(away_q).subquery()
+
+    rows = (
+        session.execute(
+            select(
+                union.c.team_name,
+                func.count(union.c.bet_id).label("total_bets"),
+                func.count(
+                    case((union.c.outcome == BetOutcome.WIN.value, 1))
+                ).label("wins"),
+                func.count(
+                    case((union.c.outcome == BetOutcome.LOSS.value, 1))
+                ).label("losses"),
+                func.coalesce(func.sum(union.c.stake), Decimal("0.00")).label("total_staked"),
+                func.coalesce(func.sum(union.c.pnl), Decimal("0.00")).label("total_pnl"),
+            )
+            .group_by(union.c.team_name)
+            .order_by(func.sum(union.c.pnl).desc())
+        )
+        .all()
+    )
+
+    result: list[SegmentROI] = []
+    for row in rows:
+        staked = Decimal(str(row.total_staked))
+        pnl = Decimal(str(row.total_pnl))
+        roi = (
+            (pnl / staked * Decimal("100")).quantize(_PCT_QUANT, ROUND_HALF_UP)
+            if staked > 0
+            else Decimal("0.00")
+        )
+        result.append(
+            SegmentROI(
+                name=row.team_name,
+                total_bets=int(row.total_bets),
+                wins=int(row.wins),
+                losses=int(row.losses),
+                total_staked=staked.quantize(_STAKE_QUANT, ROUND_HALF_UP),
+                total_pnl=pnl.quantize(_STAKE_QUANT, ROUND_HALF_UP),
+                roi=roi,
+            )
+        )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Model accuracy analytics
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ModelAccuracyStats:
+    """Accuracy metrics for the prediction model on finished matches."""
+
+    total_predictions: int
+    correct_predictions: int
+    accuracy_pct: Decimal  # percentage (0–100)
+    avg_predicted_probability: Decimal
+    avg_actual_hit_rate: Decimal  # how often the predicted selection actually won
+
+
+def get_model_accuracy(session: Session) -> ModelAccuracyStats:
+    """Evaluate model accuracy by comparing predictions against actual match results.
+
+    For each prediction on a FINISHED MATCH_WINNER match, determines if the
+    predicted selection (home/draw/away) matches the actual result.
+
+    Returns:
+        ModelAccuracyStats with overall accuracy metrics.
+    """
+    # Get all predictions for finished matches
+    rows = (
+        session.execute(
+            select(Prediction, Match)
+            .join(Match, Prediction.match_id == Match.id)
+            .where(
+                Match.status == MatchStatus.FINISHED,
+                Match.home_goals.is_not(None),
+                Match.away_goals.is_not(None),
+            )
+        )
+        .all()
+    )
+
+    if not rows:
+        return ModelAccuracyStats(
+            total_predictions=0,
+            correct_predictions=0,
+            accuracy_pct=Decimal("0.00"),
+            avg_predicted_probability=Decimal("0.000000"),
+            avg_actual_hit_rate=Decimal("0.00"),
+        )
+
+    total = 0
+    correct = 0
+    prob_sum = Decimal("0")
+
+    for prediction, match in rows:
+        # Determine actual result
+        if match.home_goals > match.away_goals:
+            actual = "home"
+        elif match.home_goals < match.away_goals:
+            actual = "away"
+        else:
+            actual = "draw"
+
+        total += 1
+        prob_sum += Decimal(str(prediction.probability))
+
+        if prediction.selection.lower() == actual:
+            correct += 1
+
+    accuracy_pct = (
+        (Decimal(str(correct)) / Decimal(str(total)) * Decimal("100")).quantize(
+            _PCT_QUANT, ROUND_HALF_UP
+        )
+        if total > 0
+        else Decimal("0.00")
+    )
+
+    avg_prob = (prob_sum / Decimal(str(total))).quantize(
+        Decimal("0.000001"), ROUND_HALF_UP
+    )
+
+    return ModelAccuracyStats(
+        total_predictions=total,
+        correct_predictions=correct,
+        accuracy_pct=accuracy_pct,
+        avg_predicted_probability=avg_prob,
+        avg_actual_hit_rate=accuracy_pct,
+    )
+
+
+def get_prediction_details(
+    session: Session,
+) -> list[tuple[str, str, Decimal, bool]]:
+    """Return per-prediction detail: (selection, match_label, probability, is_correct).
+
+    Used for building prediction accuracy visualisations.
+
+    Returns:
+        List of (selection, match_description, predicted_probability, was_correct) tuples.
+    """
+    rows = (
+        session.execute(
+            select(Prediction, Match, Team)
+            .join(Match, Prediction.match_id == Match.id)
+            .join(Team, Match.home_team_id == Team.id)
+            .where(
+                Match.status == MatchStatus.FINISHED,
+                Match.home_goals.is_not(None),
+                Match.away_goals.is_not(None),
+            )
+            .order_by(Match.kickoff.desc())
+        )
+        .all()
+    )
+
+    results: list[tuple[str, str, Decimal, bool]] = []
+    for prediction, match, home_team in rows:
+        away_team = session.get(Team, match.away_team_id)
+        away_name = away_team.name if away_team else "?"
+
+        if match.home_goals > match.away_goals:
+            actual = "home"
+        elif match.home_goals < match.away_goals:
+            actual = "away"
+        else:
+            actual = "draw"
+
+        is_correct = prediction.selection.lower() == actual
+        match_label = f"{home_team.name} vs {away_name}"
+
+        results.append((
+            prediction.selection,
+            match_label,
+            Decimal(str(prediction.probability)),
+            is_correct,
+        ))
+
+    return results
