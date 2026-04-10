@@ -1,0 +1,38 @@
+[project]
+name = "value-betting-bot"
+version = "0.1.0"
+description = "AI-powered football betting bot that detects value bets by comparing ML model predictions against bookmaker odds"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "streamlit>=1.40.0",
+    "psycopg2-binary>=2.9.9",
+    "sqlalchemy>=2.0.0",
+    "alembic>=1.13.0",
+    "pandas>=2.2.0",
+    "numpy>=1.26.0",
+    "scikit-learn>=1.4.0",
+    "requests>=2.31.0",
+    "python-dotenv>=1.0.0",
+    "plotly>=5.18.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.1.0",
+    "ruff>=0.4.0",
+    "mypy>=1.8.0",
+    "pre-commit>=3.6.0",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
