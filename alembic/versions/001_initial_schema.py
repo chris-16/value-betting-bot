@@ -21,12 +21,14 @@ def upgrade() -> None:
     matchstatus = sa.Enum(
         "SCHEDULED", "LIVE", "FINISHED", "POSTPONED", "CANCELLED",
         name="matchstatus",
+        create_type=False,
     )
     markettype = sa.Enum(
         "MATCH_WINNER", "OVER_UNDER_25", "BOTH_TEAMS_TO_SCORE", "DOUBLE_CHANCE",
         name="markettype",
+        create_type=False,
     )
-    betoutcome = sa.Enum("WIN", "LOSS", "VOID", "PENDING", name="betoutcome")
+    betoutcome = sa.Enum("WIN", "LOSS", "VOID", "PENDING", name="betoutcome", create_type=False)
 
     matchstatus.create(op.get_bind(), checkfirst=True)
     markettype.create(op.get_bind(), checkfirst=True)
