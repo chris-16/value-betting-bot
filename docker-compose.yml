@@ -40,5 +40,19 @@ services:
       timeout: 5s
       retries: 5
 
+  telegram:
+    build:
+      context: .
+      dockerfile: Dockerfile.bot
+    entrypoint: ["python", "-m", "src.telegram_bot"]
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./src:/app/src
+    restart: unless-stopped
+
 volumes:
   pgdata:

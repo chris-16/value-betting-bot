@@ -32,6 +32,11 @@ class Settings:
     odds_scan_interval_seconds: int = field(
         default_factory=lambda: int(_env("ODDS_SCAN_INTERVAL_SECONDS", "300"))
     )
+    telegram_bot_token: str = field(default_factory=lambda: _env("TELEGRAM_BOT_TOKEN", ""))
+    telegram_chat_id: str = field(default_factory=lambda: _env("TELEGRAM_CHAT_ID", ""))
+    telegram_daily_summary_hour: int = field(
+        default_factory=lambda: int(_env("TELEGRAM_DAILY_SUMMARY_HOUR", "22"))
+    )
 
 
 settings = Settings()

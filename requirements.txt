@@ -8,3 +8,4 @@ scikit-learn>=1.4.0
 requests>=2.31.0
 python-dotenv>=1.0.0
 plotly>=5.18.0
+python-telegram-bot>=21.0

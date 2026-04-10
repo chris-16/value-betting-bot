@@ -4,16 +4,34 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import date, datetime
 
 from src.config import settings
 from src.db.session import get_session
 from src.scrapers.odds_api import OddsAPIClient, OddsAPIError, scan_all_leagues
+from src.strategies.value_engine import place_paper_bet, scan_for_value
+from src.telegram_alerts import send_daily_summary, send_value_bet_alert
+from src.telegram_bot import start_bot_thread
 
 logging.basicConfig(
     level=settings.log_level,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def _should_send_daily_summary(last_summary_date: date | None) -> bool:
+    """Check if it's time to send the daily summary.
+
+    Returns True if the current hour matches the configured hour and
+    the summary hasn't been sent today yet.
+    """
+    now = datetime.now()
+    if now.hour != settings.telegram_daily_summary_hour:
+        return False
+    if last_summary_date == now.date():
+        return False
+    return True
 
 
 def run() -> None:
@@ -26,12 +44,17 @@ def run() -> None:
         settings.odds_scan_interval_seconds,
     )
 
+    # Start Telegram bot in background thread (if configured)
+    start_bot_thread()
+
     # Pre-validate API key at startup
     try:
         client = OddsAPIClient()
     except OddsAPIError:
         logger.exception("Failed to initialise Odds API client — check ODDS_API_KEY")
         return
+
+    last_summary_date: date | None = None
 
     while True:
         try:
@@ -50,19 +73,35 @@ def run() -> None:
                 )
                 for sport_key, count in results.items():
                     logger.info("  %s: %d rows", sport_key, count)
+
+                # Detect value bets and place paper bets
+                value_bets = scan_for_value(session)
+                for vb in value_bets:
+                    bet = place_paper_bet(session, vb)
+                    logger.info("Paper bet placed: %s", bet)
+
+                    # Send Telegram alert for each value bet
+                    try:
+                        send_value_bet_alert(vb, session)
+                    except Exception:
+                        logger.exception("Failed to send Telegram alert for bet %s", bet.id)
+
+                # Daily P&L summary
+                if _should_send_daily_summary(last_summary_date):
+                    try:
+                        send_daily_summary(session)
+                        last_summary_date = datetime.now().date()
+                        logger.info("Daily summary sent")
+                    except Exception:
+                        logger.exception("Failed to send daily summary")
+
             finally:
                 try:
                     next(session_gen)
                 except StopIteration:
                     pass
 
-            # TODO: run ML predictions
-            # TODO: compare predictions vs odds, detect value
-            # TODO: place paper bets
-
-            logger.info(
-                "Scan complete. Sleeping %ds...", settings.odds_scan_interval_seconds
-            )
+            logger.info("Scan complete. Sleeping %ds...", settings.odds_scan_interval_seconds)
         except Exception:
             logger.exception("Error during scan cycle")
 
