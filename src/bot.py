@@ -8,10 +8,15 @@ from datetime import date, datetime
 
 from src.config import settings
 from src.db.session import get_session
+from src.models.prediction import predict_upcoming_matches
 from src.scrapers.odds_api import OddsAPIClient, OddsAPIError, scan_all_leagues
+from src.scrapers.result_updater import update_results
 from src.strategies.value_engine import place_paper_bet, scan_for_value
-from src.telegram_alerts import send_daily_summary, send_value_bet_alert
-from src.telegram_bot import start_bot_thread
+from src.telegram_alerts import send_bet_notification, send_daily_summary
+
+# Weekly retrain: Monday at 6 AM
+_RETRAIN_DAY = 0  # Monday
+_RETRAIN_HOUR = 6
 
 logging.basicConfig(
     level=settings.log_level,
@@ -19,13 +24,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Track bets already placed (match_id, selection) to avoid duplicates
+_placed: set[tuple[int, str]] = set()
+_last_retrain_date: date | None = None
+
 
 def _should_send_daily_summary(last_summary_date: date | None) -> bool:
-    """Check if it's time to send the daily summary.
-
-    Returns True if the current hour matches the configured hour and
-    the summary hasn't been sent today yet.
-    """
     now = datetime.now()
     if now.hour != settings.telegram_daily_summary_hour:
         return False
@@ -35,7 +39,7 @@ def _should_send_daily_summary(last_summary_date: date | None) -> bool:
 
 
 def run() -> None:
-    """Main bot loop: fetch odds, run model, detect value, place paper bets."""
+    """Main bot loop: fetch odds, run model, detect value, auto-place paper bets."""
     logger.info("Value Betting Bot starting (paper trading mode)")
     logger.info(
         "Bankroll: %s | Min edge: %s | Scan interval: %ds",
@@ -44,10 +48,6 @@ def run() -> None:
         settings.odds_scan_interval_seconds,
     )
 
-    # Start Telegram bot in background thread (if configured)
-    start_bot_thread()
-
-    # Pre-validate API key at startup
     try:
         client = OddsAPIClient()
     except OddsAPIError:
@@ -60,10 +60,17 @@ def run() -> None:
         try:
             logger.info("Scanning for value bets...")
 
-            # Fetch and persist odds from all leagues
             session_gen = get_session()
             session = next(session_gen)
             try:
+                # Update results for finished matches and settle bets
+                try:
+                    updated = update_results(session)
+                    if updated:
+                        logger.info("Updated %d match results", updated)
+                except Exception:
+                    logger.exception("Error updating match results")
+
                 results = scan_all_leagues(session, client)
                 total = sum(results.values())
                 logger.info(
@@ -71,20 +78,46 @@ def run() -> None:
                     total,
                     len(results),
                 )
-                for sport_key, count in results.items():
-                    logger.info("  %s: %d rows", sport_key, count)
 
-                # Detect value bets and place paper bets
+                # Weekly model retrain (Monday 6AM)
+                global _last_retrain_date
+                now = datetime.now()
+                if (
+                    now.weekday() == _RETRAIN_DAY
+                    and now.hour == _RETRAIN_HOUR
+                    and _last_retrain_date != now.date()
+                ):
+                    try:
+                        from src.models.learning import retrain_model
+
+                        retrain_model(session)
+                        _last_retrain_date = now.date()
+                        logger.info("Weekly model retrain complete")
+                    except Exception:
+                        logger.exception("Error during weekly model retrain")
+
+                # Generate predictions for matches that don't have them yet
+                try:
+                    predicted = predict_upcoming_matches(session, limit=10)
+                    logger.info("Generated predictions for %d matches", len(predicted))
+                except Exception:
+                    logger.exception("Error generating predictions")
+
+                # Detect value bets, auto-place, and notify
                 value_bets = scan_for_value(session)
                 for vb in value_bets:
+                    key = (vb.match_id, vb.selection)
+                    if key in _placed:
+                        continue
+
                     bet = place_paper_bet(session, vb)
+                    _placed.add(key)
                     logger.info("Paper bet placed: %s", bet)
 
-                    # Send Telegram alert for each value bet
                     try:
-                        send_value_bet_alert(vb, session)
+                        send_bet_notification(vb, session)
                     except Exception:
-                        logger.exception("Failed to send Telegram alert for bet %s", bet.id)
+                        logger.exception("Failed to send Telegram notification")
 
                 # Daily P&L summary
                 if _should_send_daily_summary(last_summary_date):

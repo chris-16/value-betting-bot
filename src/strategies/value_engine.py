@@ -73,7 +73,7 @@ def calculate_edge(predicted_probability: Decimal, implied_probability: Decimal)
 def kelly_criterion(
     predicted_probability: Decimal,
     decimal_odds: Decimal,
-    fraction: Decimal = Decimal("0.25"),
+    fraction: Decimal = Decimal("0.50"),
 ) -> Decimal:
     """Compute fractional Kelly Criterion stake as a fraction of bankroll.
 

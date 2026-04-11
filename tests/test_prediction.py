@@ -1,26 +1,22 @@
-"""Tests for the prediction wrapper module."""
+"""Tests for the prediction wrapper module (Poisson + ELO ensemble)."""
 
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime
 from decimal import Decimal
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
-from src.db.models import League, MarketType, Match, MatchStatus, Prediction, Team
+from src.db.models import League, MarketType, Match, MatchStatus, Prediction, Team, TeamXGStats
 from src.db.session import Base
-from src.models.claude_llm import ClaudeCLIError
 from src.models.prediction import (
     MODEL_VERSION,
     MatchPrediction,
-    _build_consensus_prompt,
     _normalise_probabilities,
     predict_and_store,
-    predict_match,
     predict_upcoming_matches,
 )
 
@@ -50,6 +46,42 @@ def _create_match(session: Session) -> Match:
     session.add(match)
     session.flush()
     return match
+
+
+def _create_finished_matches(session: Session, count: int = 10) -> list[Match]:
+    """Create finished matches for Poisson model fitting."""
+    league = session.query(League).first()
+    if league is None:
+        league = League(name="Premier League", country="England")
+        session.add(league)
+        session.flush()
+
+    teams = session.query(Team).all()
+    if len(teams) < 4:
+        for name in ["TeamA", "TeamB", "TeamC", "TeamD"]:
+            t = Team(name=name)
+            session.add(t)
+        session.flush()
+        teams = session.query(Team).all()
+
+    matches = []
+    for i in range(count):
+        home = teams[i % len(teams)]
+        away = teams[(i + 1) % len(teams)]
+        m = Match(
+            league_id=league.id,
+            home_team_id=home.id,
+            away_team_id=away.id,
+            kickoff=datetime(2026, 1, 1 + i, 15, 0, tzinfo=UTC),
+            status=MatchStatus.FINISHED,
+            home_goals=i % 3,
+            away_goals=(i + 1) % 3,
+        )
+        session.add(m)
+        matches.append(m)
+
+    session.flush()
+    return matches
 
 
 # ---------------------------------------------------------------------------
@@ -131,117 +163,26 @@ class TestNormaliseProbabilities:
 
 
 # ---------------------------------------------------------------------------
-# Prompt building tests
+# Model version tests
 # ---------------------------------------------------------------------------
 
 
-class TestBuildConsensusPrompt:
-    def test_contains_team_names(self) -> None:
-        prompt = _build_consensus_prompt("Liverpool", "Man City")
-        assert "Liverpool" in prompt
-        assert "Man City" in prompt
-
-    def test_contains_league(self) -> None:
-        prompt = _build_consensus_prompt("Bayern", "Dortmund", league="Bundesliga")
-        assert "Bundesliga" in prompt
-
-    def test_contains_all_personas(self) -> None:
-        prompt = _build_consensus_prompt("TeamA", "TeamB")
-        assert "Statistician" in prompt
-        assert "Tactician" in prompt
-        assert "Sentiment Analyst" in prompt
-        assert "Context Analyst" in prompt
-        assert "Risk Assessor" in prompt
-
-    def test_requests_json(self) -> None:
-        prompt = _build_consensus_prompt("TeamA", "TeamB")
-        assert "JSON" in prompt
-        assert "home_win_probability" in prompt
-
-    def test_additional_context_included(self) -> None:
-        prompt = _build_consensus_prompt(
-            "TeamA", "TeamB", additional_context="Star striker injured"
-        )
-        assert "Star striker injured" in prompt
+class TestModelVersion:
+    def test_model_version_is_poisson(self) -> None:
+        assert MODEL_VERSION == "poisson-v1"
 
 
 # ---------------------------------------------------------------------------
-# predict_match tests (mock Claude CLI)
-# ---------------------------------------------------------------------------
-
-MOCK_CLAUDE_RESPONSE: dict = {
-    "home_win_probability": 0.55,
-    "draw_probability": 0.25,
-    "away_win_probability": 0.20,
-    "confidence": 0.75,
-    "reasoning": "Home team has strong recent form and home advantage.",
-    "agent_analyses": [
-        {
-            "agent": "Statistician",
-            "home_prob": 0.60,
-            "draw_prob": 0.20,
-            "away_prob": 0.20,
-            "key_factors": ["form", "xG"],
-        }
-    ],
-}
-
-
-class TestPredictMatch:
-    @patch("src.models.prediction.query_claude_json")
-    def test_returns_prediction(self, mock_claude: object) -> None:
-        mock_claude.return_value = MOCK_CLAUDE_RESPONSE  # type: ignore[attr-defined]
-
-        result = predict_match("Arsenal", "Chelsea", league="Premier League")
-
-        assert isinstance(result, MatchPrediction)
-        assert result.home_prob > Decimal("0")
-        assert result.draw_prob > Decimal("0")
-        assert result.away_prob > Decimal("0")
-        assert result.model_version == MODEL_VERSION
-
-    @patch("src.models.prediction.query_claude_json")
-    def test_probabilities_normalised(self, mock_claude: object) -> None:
-        mock_claude.return_value = MOCK_CLAUDE_RESPONSE  # type: ignore[attr-defined]
-
-        result = predict_match("Arsenal", "Chelsea")
-        total = result.home_prob + result.draw_prob + result.away_prob
-        assert abs(total - Decimal("1")) < Decimal("0.01")
-
-    @patch("src.models.prediction.query_claude_json")
-    def test_handles_unnormalised_response(self, mock_claude: object) -> None:
-        mock_claude.return_value = {  # type: ignore[attr-defined]
-            "home_win_probability": 0.6,
-            "draw_probability": 0.3,
-            "away_win_probability": 0.3,
-            "confidence": 0.5,
-            "reasoning": "Bad maths",
-        }
-
-        result = predict_match("TeamA", "TeamB")
-        total = result.home_prob + result.draw_prob + result.away_prob
-        assert abs(total - Decimal("1")) < Decimal("0.01")
-
-    @patch("src.models.prediction.query_claude_json")
-    def test_claude_error_propagates(self, mock_claude: object) -> None:
-        mock_claude.side_effect = ClaudeCLIError("CLI failed")  # type: ignore[attr-defined]
-
-        with pytest.raises(ClaudeCLIError, match="CLI failed"):
-            predict_match("TeamA", "TeamB")
-
-
-# ---------------------------------------------------------------------------
-# predict_and_store tests (mock Claude CLI + in-memory DB)
+# predict_and_store tests (Poisson model + in-memory DB)
 # ---------------------------------------------------------------------------
 
 
 class TestPredictAndStore:
-    @patch("src.models.prediction.query_claude_json")
-    def test_stores_three_predictions(self, mock_claude: object) -> None:
-        mock_claude.return_value = MOCK_CLAUDE_RESPONSE  # type: ignore[attr-defined]
-
+    def test_stores_three_predictions(self) -> None:
         session = _make_session()
         match = _create_match(session)
+        # Create some finished matches so Poisson can fit
+        _create_finished_matches(session, count=10)
 
         result = predict_and_store(session, match.id)
 
@@ -259,24 +200,25 @@ class TestPredictAndStore:
         assert isinstance(result, MatchPrediction)
         session.close()
 
-    @patch("src.models.prediction.query_claude_json")
-    def test_updates_existing_predictions(self, mock_claude: object) -> None:
-        mock_claude.return_value = MOCK_CLAUDE_RESPONSE  # type: ignore[attr-defined]
-
+    def test_probabilities_sum_to_one(self) -> None:
         session = _make_session()
         match = _create_match(session)
+        _create_finished_matches(session, count=10)
+
+        result = predict_and_store(session, match.id)
+        total = result.home_prob + result.draw_prob + result.away_prob
+        assert abs(total - Decimal("1")) < Decimal("0.01")
+        session.close()
+
+    def test_updates_existing_predictions(self) -> None:
+        session = _make_session()
+        match = _create_match(session)
+        _create_finished_matches(session, count=10)
 
         # First prediction
         predict_and_store(session, match.id)
 
-        # Second prediction with different values
-        mock_claude.return_value = {  # type: ignore[attr-defined]
-            "home_win_probability": 0.40,
-            "draw_probability": 0.30,
-            "away_win_probability": 0.30,
-            "confidence": 0.60,
-            "reasoning": "Updated assessment",
-        }
+        # Second prediction (should update, not duplicate)
         predict_and_store(session, match.id)
 
         # Should still have only 3 rows (updated, not duplicated)
@@ -297,12 +239,10 @@ class TestPredictAndStore:
 
 
 class TestPredictUpcomingMatches:
-    @patch("src.models.prediction.query_claude_json")
-    def test_predicts_scheduled_matches(self, mock_claude: object) -> None:
-        mock_claude.return_value = MOCK_CLAUDE_RESPONSE  # type: ignore[attr-defined]
-
+    def test_predicts_scheduled_matches(self) -> None:
         session = _make_session()
         match = _create_match(session)
+        _create_finished_matches(session, count=10)
 
         results = predict_upcoming_matches(session, limit=5)
 
@@ -311,12 +251,10 @@ class TestPredictUpcomingMatches:
         assert isinstance(results[0][1], MatchPrediction)
         session.close()
 
-    @patch("src.models.prediction.query_claude_json")
-    def test_skips_already_predicted_matches(self, mock_claude: object) -> None:
-        mock_claude.return_value = MOCK_CLAUDE_RESPONSE  # type: ignore[attr-defined]
-
+    def test_skips_already_predicted_matches(self) -> None:
         session = _make_session()
         _create_match(session)
+        _create_finished_matches(session, count=10)
 
         # First run — predicts the match
         predict_upcoming_matches(session, limit=5)
@@ -326,81 +264,101 @@ class TestPredictUpcomingMatches:
         assert len(results) == 0
         session.close()
 
-    @patch("src.models.prediction.query_claude_json")
-    def test_handles_claude_errors_gracefully(self, mock_claude: object) -> None:
-        mock_claude.side_effect = ClaudeCLIError("CLI failed")  # type: ignore[attr-defined]
+
+# ---------------------------------------------------------------------------
+# Poisson model tests
+# ---------------------------------------------------------------------------
+
+
+class TestPoissonPredictor:
+    def test_predict_returns_valid_probabilities(self) -> None:
+        from src.models.poisson import PoissonPredictor
 
         session = _make_session()
         _create_match(session)
+        _create_finished_matches(session, count=20)
 
-        # Should not raise, just skip the failed match
-        results = predict_upcoming_matches(session, limit=5)
-        assert len(results) == 0
+        predictor = PoissonPredictor()
+        predictor.fit(session)
+
+        teams = session.query(Team).all()
+        if len(teams) >= 2:
+            result = predictor.predict(teams[0].id, teams[1].id)
+            total = result.home_win + result.draw + result.away_win
+            assert abs(total - 1.0) < 0.01
+            assert result.home_win >= 0
+            assert result.draw >= 0
+            assert result.away_win >= 0
+            assert result.home_lambda > 0
+            assert result.away_lambda > 0
+
+        session.close()
+
+    def test_score_matrix_shape(self) -> None:
+        from src.models.poisson import MAX_GOALS, PoissonPredictor
+
+        session = _make_session()
+        _create_match(session)
+        _create_finished_matches(session, count=20)
+
+        predictor = PoissonPredictor()
+        predictor.fit(session)
+
+        teams = session.query(Team).all()
+        if len(teams) >= 2:
+            result = predictor.predict(teams[0].id, teams[1].id)
+            assert len(result.score_matrix) == MAX_GOALS + 1
+            assert len(result.score_matrix[0]) == MAX_GOALS + 1
+
+        session.close()
+
+    def test_unknown_team_defaults_to_average(self) -> None:
+        from src.models.poisson import PoissonPredictor
+
+        session = _make_session()
+        _create_finished_matches(session, count=10)
+
+        predictor = PoissonPredictor()
+        predictor.fit(session)
+
+        # Predict for team IDs that don't exist
+        result = predictor.predict(99999, 99998)
+        total = result.home_win + result.draw + result.away_win
+        assert abs(total - 1.0) < 0.01
+
         session.close()
 
 
 # ---------------------------------------------------------------------------
-# Claude LLM adapter tests
+# Calibration tests
 # ---------------------------------------------------------------------------
 
 
-class TestClaudeLLM:
-    @patch("src.models.claude_llm.subprocess.run")
-    def test_query_claude_success(self, mock_run: object) -> None:
-        from src.models.claude_llm import query_claude
+class TestProbabilityCalibrator:
+    def test_calibrate_unfitted_returns_input(self) -> None:
+        from src.models.calibration import ProbabilityCalibrator
 
-        mock_run.return_value = type(  # type: ignore[attr-defined]
-            "Result", (), {"returncode": 0, "stdout": "Hello world", "stderr": ""}
-        )()
-        result = query_claude("test prompt")
-        assert result == "Hello world"
+        cal = ProbabilityCalibrator()
+        assert cal.calibrate(0.5) == 0.5
 
-    @patch("src.models.claude_llm.subprocess.run")
-    def test_query_claude_error(self, mock_run: object) -> None:
-        from src.models.claude_llm import query_claude
+    def test_calibrate_triple_normalises(self) -> None:
+        from src.models.calibration import ProbabilityCalibrator
 
-        mock_run.return_value = type(  # type: ignore[attr-defined]
-            "Result", (), {"returncode": 1, "stdout": "", "stderr": "Error occurred"}
-        )()
-        with pytest.raises(ClaudeCLIError, match="exited with code 1"):
-            query_claude("test prompt")
+        cal = ProbabilityCalibrator()
+        h, d, a = cal.calibrate_triple(0.5, 0.3, 0.2)
+        assert abs(h + d + a - 1.0) < 0.01
 
-    @patch("src.models.claude_llm.subprocess.run")
-    def test_query_claude_json_parses_response(self, mock_run: object) -> None:
-        from src.models.claude_llm import query_claude_json
+    def test_fit_and_calibrate(self) -> None:
+        from src.models.calibration import ProbabilityCalibrator
 
-        response_json = json.dumps({"key": "value"})
-        mock_run.return_value = type(  # type: ignore[attr-defined]
-            "Result", (), {"returncode": 0, "stdout": response_json, "stderr": ""}
-        )()
-        result = query_claude_json("test prompt")
-        assert result == {"key": "value"}
+        cal = ProbabilityCalibrator()
+        # Simple calibration data
+        probs = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.1, 0.5, 0.9]
+        outcomes = [0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 1, 1]
 
-    @patch("src.models.claude_llm.subprocess.run")
-    def test_query_claude_json_handles_markdown_fences(self, mock_run: object) -> None:
-        from src.models.claude_llm import query_claude_json
+        cal.fit(probs, outcomes)
+        assert cal.is_fitted
 
-        response_text = '```json\n{"key": "value"}\n```'
-        mock_run.return_value = type(  # type: ignore[attr-defined]
-            "Result", (), {"returncode": 0, "stdout": response_text, "stderr": ""}
-        )()
-        result = query_claude_json("test prompt")
-        assert result == {"key": "value"}
-
-    @patch("src.models.claude_llm.subprocess.run")
-    def test_query_claude_timeout(self, mock_run: object) -> None:
-        import subprocess as sp
-
-        from src.models.claude_llm import query_claude
-
-        mock_run.side_effect = sp.TimeoutExpired(cmd="claude", timeout=120)  # type: ignore[attr-defined]
-        with pytest.raises(ClaudeCLIError, match="timed out"):
-            query_claude("test prompt")
-
-    @patch("src.models.claude_llm.subprocess.run")
-    def test_query_claude_not_found(self, mock_run: object) -> None:
-        from src.models.claude_llm import query_claude
-
-        mock_run.side_effect = FileNotFoundError()  # type: ignore[attr-defined]
-        with pytest.raises(ClaudeCLIError, match="not found"):
-            query_claude("test prompt")
+        # Calibrated output should be between 0 and 1
+        result = cal.calibrate(0.5)
+        assert 0.0 < result < 1.0

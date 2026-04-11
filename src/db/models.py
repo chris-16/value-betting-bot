@@ -9,8 +9,10 @@ from decimal import Decimal
 from sqlalchemy import (
     DateTime,
     Enum,
+    Float,
     ForeignKey,
     Index,
+    Integer,
     Numeric,
     String,
     Text,
@@ -48,6 +50,24 @@ class MarketType(enum.Enum):
     OVER_UNDER_25 = "over_under_2.5"
     BOTH_TEAMS_TO_SCORE = "btts"
     DOUBLE_CHANCE = "double_chance"
+
+
+class TeamElo(Base):
+    """ELO rating for a team."""
+
+    __tablename__ = "team_elo"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    team_id: Mapped[int] = mapped_column(ForeignKey("teams.id"), nullable=False, unique=True)
+    rating: Mapped[Decimal] = mapped_column(Numeric(10, 1), nullable=False, default=1500.0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    team: Mapped[Team] = relationship()
+
+    def __repr__(self) -> str:
+        return f"<TeamElo team={self.team_id} rating={self.rating}>"
 
 
 class League(Base):
@@ -108,6 +128,8 @@ class Match(Base):
     )
     home_goals: Mapped[int | None] = mapped_column()
     away_goals: Mapped[int | None] = mapped_column()
+    home_xg: Mapped[Decimal | None] = mapped_column(Numeric(10, 2))
+    away_xg: Mapped[Decimal | None] = mapped_column(Numeric(10, 2))
     external_id: Mapped[str | None] = mapped_column(String(100), unique=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
@@ -235,3 +257,51 @@ class Bet(Base):
 
     def __repr__(self) -> str:
         return f"<Bet {self.selection} stake={self.stake} outcome={self.outcome}>"
+
+
+class TeamXGStats(Base):
+    """Expected goals statistics for a team in a season."""
+
+    __tablename__ = "team_xg_stats"
+    __table_args__ = (
+        UniqueConstraint("team_id", "league_id", "season", name="uq_team_xg_season"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    team_id: Mapped[int] = mapped_column(ForeignKey("teams.id"), nullable=False)
+    league_id: Mapped[int] = mapped_column(ForeignKey("leagues.id"), nullable=False)
+    season: Mapped[str] = mapped_column(String(20), nullable=False)
+    xg: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+    xga: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+    xg_per_match: Mapped[Decimal] = mapped_column(Numeric(10, 4), nullable=False)
+    xga_per_match: Mapped[Decimal] = mapped_column(Numeric(10, 4), nullable=False)
+    matches_played: Mapped[int] = mapped_column(default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    team: Mapped[Team] = relationship()
+    league: Mapped[League] = relationship()
+
+    def __repr__(self) -> str:
+        return f"<TeamXGStats team={self.team_id} xG={self.xg} xGA={self.xga}>"
+
+
+class ModelRun(Base):
+    """Tracking table for model training runs."""
+
+    __tablename__ = "model_runs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    model_version: Mapped[str] = mapped_column(String(50), nullable=False)
+    trained_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    train_matches: Mapped[int] = mapped_column(default=0)
+    brier_score: Mapped[float | None] = mapped_column(Float)
+    log_loss: Mapped[float | None] = mapped_column(Float)
+    notes: Mapped[str | None] = mapped_column(Text)
+
+    def __repr__(self) -> str:
+        return f"<ModelRun {self.model_version} brier={self.brier_score}>"

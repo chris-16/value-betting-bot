@@ -1,13 +1,13 @@
-"""Prediction wrapper — integrates w5-football-prediction with Claude CLI consensus.
+"""Prediction wrapper — Poisson xG model with ELO ensemble.
 
-Provides a simple interface: given a match (by ID or team names), returns
-home/draw/away outcome probabilities. Predictions are persisted to the
-database for later comparison with actual results.
+Replaces the previous Claude LLM consensus approach with a statistical
+Poisson model based on xG data, blended with ELO as a minor ensemble.
 
 Architecture:
-    1. Baseline layer: w5-football-prediction's SimpleELOPredictor
-    2. Consensus layer: Multi-agent debate using Claude CLI (Max plan)
-    3. Fusion: Weighted average of baseline + consensus predictions
+    1. Primary: PoissonPredictor (xG-based attack/defense ratings)
+    2. Secondary: ELO baseline (15% weight)
+    3. Calibration: Isotonic regression on historical predictions
+    4. Fusion: 85% Poisson + 15% ELO
 """
 
 from __future__ import annotations
@@ -19,56 +19,12 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from src.config import settings
 from src.db.models import MarketType, Match, Prediction
-from src.models.claude_llm import ClaudeCLIError, query_claude_json
 
 logger = logging.getLogger(__name__)
 
-MODEL_VERSION = "w5-claude-v1"
-
-# Consensus agent personas — each analyses the match from a different angle
-AGENT_PERSONAS: list[dict[str, str]] = [
-    {
-        "name": "Statistician",
-        "focus": (
-            "Historical data, head-to-head records, league standings, "
-            "and statistical patterns. Emphasise xG, possession stats, "
-            "and recent form over last 5-10 matches."
-        ),
-    },
-    {
-        "name": "Tactician",
-        "focus": (
-            "Formation matchups, tactical approaches, manager tendencies, "
-            "playing styles, and how each team's strengths/weaknesses "
-            "interact in this specific fixture."
-        ),
-    },
-    {
-        "name": "Sentiment Analyst",
-        "focus": (
-            "Market sentiment, betting line movements, public vs sharp money, "
-            "media narrative, and any psychological factors like pressure, "
-            "motivation, or derby significance."
-        ),
-    },
-    {
-        "name": "Context Analyst",
-        "focus": (
-            "Injuries, suspensions, squad rotation, fixture congestion, "
-            "weather conditions, travel fatigue, and any off-field factors "
-            "that could impact performance."
-        ),
-    },
-    {
-        "name": "Risk Assessor",
-        "focus": (
-            "Uncertainty quantification, upset probability, draw likelihood, "
-            "variance in team performance, and situations where the consensus "
-            "might be overconfident."
-        ),
-    },
-]
+MODEL_VERSION = "poisson-v1"
 
 
 @dataclass(frozen=True)
@@ -100,66 +56,6 @@ def _safe_decimal(value: Any) -> Decimal:
         return Decimal("0")
 
 
-def _build_consensus_prompt(
-    home_team: str,
-    away_team: str,
-    *,
-    league: str = "",
-    additional_context: str = "",
-) -> str:
-    """Build the multi-agent consensus prompt for Claude.
-
-    Asks Claude to role-play all five analyst personas, debate the match,
-    and return a unified probability prediction as JSON.
-    """
-    personas_text = "\n".join(
-        f"  {i + 1}. **{p['name']}**: {p['focus']}" for i, p in enumerate(AGENT_PERSONAS)
-    )
-
-    league_ctx = f" ({league})" if league else ""
-    extra_ctx = f"\n\nAdditional context:\n{additional_context}" if additional_context else ""
-
-    return f"""You are a football match prediction system using a multi-agent consensus approach.
-
-Analyse the following match and predict the outcome probabilities:
-
-**Match:** {home_team} vs {away_team}{league_ctx}{extra_ctx}
-
-You must simulate {len(AGENT_PERSONAS)} expert analyst personas, each providing
-their independent assessment:
-
-{personas_text}
-
-Process:
-1. Each analyst provides their initial probability estimate with reasoning.
-2. Analysts review each other's assessments and revise if warranted.
-3. Produce a final consensus prediction.
-
-Return your response as a JSON object with EXACTLY this structure:
-{{
-    "home_win_probability": <float 0-1>,
-    "draw_probability": <float 0-1>,
-    "away_win_probability": <float 0-1>,
-    "confidence": <float 0-1>,
-    "reasoning": "<brief summary of key factors and consensus reasoning>",
-    "agent_analyses": [
-        {{
-            "agent": "<persona name>",
-            "home_prob": <float>,
-            "draw_prob": <float>,
-            "away_prob": <float>,
-            "key_factors": ["<factor1>", "<factor2>"]
-        }}
-    ]
-}}
-
-IMPORTANT:
-- Probabilities MUST sum to exactly 1.0.
-- Base your analysis on your knowledge of these teams and general football patterns.
-- If you are uncertain, reflect that in lower confidence and more evenly distributed probabilities.
-- Return ONLY the JSON object, no other text."""
-
-
 def _normalise_probabilities(
     home: Decimal, draw: Decimal, away: Decimal
 ) -> tuple[Decimal, Decimal, Decimal]:
@@ -175,65 +71,82 @@ def _normalise_probabilities(
 
 
 def predict_match(
-    home_team: str,
-    away_team: str,
-    *,
-    league: str = "",
-    additional_context: str = "",
-    model: str = "claude-sonnet-4-20250514",
-    timeout: int = 120,
+    session: Session,
+    home_team_id: int,
+    away_team_id: int,
+    league_id: int | None = None,
 ) -> MatchPrediction:
-    """Predict match outcome probabilities using Claude CLI consensus.
+    """Predict match outcome using Poisson model + ELO ensemble.
 
     Args:
-        home_team: Name of the home team.
-        away_team: Name of the away team.
-        league: Optional league/competition name for context.
-        additional_context: Optional extra context (injuries, form, etc.).
-        model: Claude model to use.
-        timeout: Max seconds to wait for Claude response.
+        session: Active SQLAlchemy session.
+        home_team_id: DB ID of the home team.
+        away_team_id: DB ID of the away team.
+        league_id: Optional league filter for model fitting.
 
     Returns:
         MatchPrediction with home/draw/away probabilities.
-
-    Raises:
-        ClaudeCLIError: If Claude CLI fails or returns invalid data.
     """
-    prompt = _build_consensus_prompt(
-        home_team, away_team, league=league, additional_context=additional_context
+    from src.models.calibration import ProbabilityCalibrator
+    from src.models.elo import get_team_rating, predict_match as elo_predict
+    from src.models.poisson import PoissonPredictor
+
+    # 1. Poisson prediction
+    predictor = PoissonPredictor()
+    predictor.fit(session, league_id=league_id)
+    poisson_pred = predictor.predict(home_team_id, away_team_id)
+
+    poisson_home = poisson_pred.home_win
+    poisson_draw = poisson_pred.draw
+    poisson_away = poisson_pred.away_win
+
+    # 2. Calibrate Poisson output
+    calibrator = ProbabilityCalibrator()
+    calibrator.load()
+    if calibrator.is_fitted:
+        poisson_home, poisson_draw, poisson_away = calibrator.calibrate_triple(
+            poisson_home, poisson_draw, poisson_away
+        )
+
+    # 3. ELO prediction
+    home_elo = get_team_rating(session, home_team_id)
+    away_elo = get_team_rating(session, away_team_id)
+    elo_pred = elo_predict(home_elo, away_elo)
+
+    # 4. Ensemble: 85% Poisson + 15% ELO
+    w_poisson = Decimal("0.85")
+    w_elo = Decimal("0.15")
+
+    fused_home = w_poisson * Decimal(str(poisson_home)) + w_elo * Decimal(str(elo_pred.home_prob))
+    fused_draw = w_poisson * Decimal(str(poisson_draw)) + w_elo * Decimal(str(elo_pred.draw_prob))
+    fused_away = w_poisson * Decimal(str(poisson_away)) + w_elo * Decimal(str(elo_pred.away_prob))
+
+    fused_home, fused_draw, fused_away = _normalise_probabilities(
+        fused_home, fused_draw, fused_away
     )
 
-    logger.info("Requesting prediction: %s vs %s", home_team, away_team)
-
-    response = query_claude_json(prompt, model=model, timeout=timeout)
-
-    # Extract probabilities from response
-    home_raw = _safe_decimal(response.get("home_win_probability", 0))
-    draw_raw = _safe_decimal(response.get("draw_probability", 0))
-    away_raw = _safe_decimal(response.get("away_win_probability", 0))
-
-    home_prob, draw_prob, away_prob = _normalise_probabilities(home_raw, draw_raw, away_raw)
-
-    confidence = _safe_decimal(response.get("confidence", "0.5"))
-    reasoning = str(response.get("reasoning", ""))
+    reasoning = (
+        f"Poisson(λH={poisson_pred.home_lambda:.2f}, λA={poisson_pred.away_lambda:.2f}) "
+        f"→ [{poisson_pred.home_win:.0%}/{poisson_pred.draw:.0%}/{poisson_pred.away_win:.0%}] | "
+        f"ELO({home_elo:.0f} vs {away_elo:.0f}) "
+        f"→ [{elo_pred.home_prob:.0%}/{elo_pred.draw_prob:.0%}/{elo_pred.away_prob:.0%}]"
+    )
 
     prediction = MatchPrediction(
-        home_prob=home_prob,
-        draw_prob=draw_prob,
-        away_prob=away_prob,
-        confidence=confidence,
+        home_prob=fused_home,
+        draw_prob=fused_draw,
+        away_prob=fused_away,
+        confidence=Decimal("0.75"),  # Poisson always produces output; static confidence
         model_version=MODEL_VERSION,
         reasoning=reasoning,
     )
 
     logger.info(
-        "Prediction: %s %s / draw %s / %s %s (confidence: %s)",
-        home_team,
-        home_prob,
-        draw_prob,
-        away_team,
-        away_prob,
-        confidence,
+        "Prediction: home=%s draw=%s away=%s (%s)",
+        fused_home,
+        fused_draw,
+        fused_away,
+        MODEL_VERSION,
     )
 
     return prediction
@@ -243,26 +156,25 @@ def predict_and_store(
     session: Session,
     match_id: int,
     *,
-    additional_context: str = "",
-    model: str = "claude-sonnet-4-20250514",
+    additional_context: str | None = None,
+    model: str = "",
 ) -> MatchPrediction:
     """Predict match outcome and persist results to the database.
 
-    Loads the match from the database, runs the prediction, and stores
-    home/draw/away probabilities as Prediction rows.
+    Uses the Poisson + ELO ensemble model. The `model` and `additional_context`
+    parameters are kept for API compatibility but are not used by the Poisson model.
 
     Args:
         session: Active SQLAlchemy session.
         match_id: ID of the Match to predict.
-        additional_context: Optional extra context for the prediction.
-        model: Claude model to use.
+        additional_context: Unused (kept for compatibility).
+        model: Unused (kept for compatibility).
 
     Returns:
         MatchPrediction with the predicted probabilities.
 
     Raises:
         ValueError: If match_id is not found.
-        ClaudeCLIError: If Claude CLI fails.
     """
     match = session.get(Match, match_id)
     if match is None:
@@ -270,14 +182,21 @@ def predict_and_store(
 
     home_team_name = match.home_team.name
     away_team_name = match.away_team.name
-    league_name = match.league.name
 
     prediction = predict_match(
+        session,
+        match.home_team_id,
+        match.away_team_id,
+        league_id=match.league_id,
+    )
+
+    logger.info(
+        "Poisson ensemble: [%s/%s/%s] for %s vs %s",
+        prediction.home_prob * 100,
+        prediction.draw_prob * 100,
+        prediction.away_prob * 100,
         home_team_name,
         away_team_name,
-        league=league_name,
-        additional_context=additional_context,
-        model=model,
     )
 
     # Persist predictions — one row per selection (home, draw, away)
@@ -340,7 +259,7 @@ def predict_upcoming_matches(
     session: Session,
     *,
     limit: int = 10,
-    model: str = "claude-sonnet-4-20250514",
+    model: str = "",
 ) -> list[tuple[Match, MatchPrediction]]:
     """Predict outcomes for upcoming scheduled matches.
 
@@ -350,7 +269,7 @@ def predict_upcoming_matches(
     Args:
         session: Active SQLAlchemy session.
         limit: Maximum number of matches to predict.
-        model: Claude model to use.
+        model: Unused (kept for compatibility).
 
     Returns:
         List of (Match, MatchPrediction) tuples.
@@ -384,9 +303,9 @@ def predict_upcoming_matches(
 
     for match in matches:
         try:
-            prediction = predict_and_store(session, match.id, model=model)
+            prediction = predict_and_store(session, match.id)
             results.append((match, prediction))
-        except (ClaudeCLIError, ValueError):
+        except (ValueError, Exception):
             logger.exception("Failed to predict match %d", match.id)
             continue
 
